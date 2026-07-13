@@ -1,0 +1,12 @@
+# Copy to adapters/<name>.local.toml. Local adapter files are gitignored.
+name = "example"
+
+[web]
+repo = "/absolute/path/to/web-worktree"
+engine = "apple"
+image = "docker.io/library/node:24-bookworm-slim"
+
+[ios]
+repo = "/absolute/path/to/ios-worktree"
+# Optional source simulator UDID/name for `ios prepare --clone-simulator`.
+simulator_source = "iPhone 17 Pro Max"
