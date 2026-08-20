@@ -39,6 +39,7 @@ class RetiredSandboxRoot:
 RENAME_EXCL = 0x00000004
 RENAME_SWAP = 0x00000002
 RENAME_NOFOLLOW_ANY = 0x00000010
+CLONE_NOFOLLOW = 0x00000001
 
 XCODE_PATH_ENVIRONMENT_KEYS = frozenset(
     {
@@ -306,6 +307,36 @@ def rename_swap_at(directory_fd: int, first: str, second: str) -> None:
     if result != 0:
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number), second)
+
+
+def clone_directory_at(
+    source_directory_fd: int,
+    source_name: str,
+    target_directory_fd: int,
+    target_name: str,
+) -> None:
+    try:
+        clonefileat = ctypes.CDLL(None, use_errno=True).clonefileat
+    except AttributeError as error:
+        raise OSError("clonefileat is unavailable") from error
+    clonefileat.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    clonefileat.restype = ctypes.c_int
+    result = clonefileat(
+        source_directory_fd,
+        os.fsencode(source_name),
+        target_directory_fd,
+        os.fsencode(target_name),
+        CLONE_NOFOLLOW,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), target_name)
 
 
 def remove_owned_directory_at(
@@ -2967,10 +2998,95 @@ def run_ios_with_owned_simulator(
         return run_ios_lane(repo, udid, command, keep_booted, lease_held=True)
 
 
-def prepare_ios_sandbox(repo: Path, source: str | None) -> tuple[Path, str | None]:
+def seed_ios_source_packages(repo: Path, seed_repo: Path) -> None:
+    # Caller must hold the target's lane lease; the seed's lease is taken
+    # nonblocking here so an active seed-side lane refuses instead of racing.
+    target_root = require_safe_sandbox_root(sandbox_root(repo))
+    source_root = require_safe_sandbox_root(sandbox_root(seed_repo))
+    if source_root == target_root:
+        raise SandboxError("cannot seed Swift packages from the target's own sandbox")
+    if not source_root.is_dir():
+        raise SandboxError(f"seed sandbox does not exist: {source_root}")
+    name = "SourcePackages"
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    with try_ios_lane_lease(ios_lane_lock_path(seed_repo)) as acquired:
+        if not acquired:
+            raise SandboxError(
+                "seed sandbox is in use; retry after its active lane finishes"
+            )
+        source_fd = open_owned_directory(
+            source_root, "unsafe seed sandbox root", create=False
+        )
+        try:
+            try:
+                packages_fd = os.open(name, directory_flags, dir_fd=source_fd)
+            except OSError as error:
+                raise SandboxError(
+                    f"unsafe seed Swift packages: {source_root / name}"
+                ) from error
+            try:
+                packages_stat = os.fstat(packages_fd)
+                if (
+                    not stat.S_ISDIR(packages_stat.st_mode)
+                    or packages_stat.st_uid != os.getuid()
+                ):
+                    raise SandboxError(
+                        f"unsafe seed Swift packages: {source_root / name}"
+                    )
+                if not os.listdir(packages_fd):
+                    raise SandboxError(
+                        f"seed sandbox has no Swift packages: {source_root / name}"
+                    )
+            finally:
+                os.close(packages_fd)
+            target_fd = open_owned_directory(
+                target_root, "unsafe simulator sandbox root", create=False
+            )
+            try:
+                try:
+                    existing_fd = os.open(name, directory_flags, dir_fd=target_fd)
+                except FileNotFoundError:
+                    existing_fd = -1
+                except OSError as error:
+                    raise SandboxError(
+                        f"unsafe simulator sandbox directory: {target_root / name}"
+                    ) from error
+                if existing_fd >= 0:
+                    try:
+                        if os.listdir(existing_fd):
+                            raise SandboxError(
+                                f"sandbox already has Swift packages: "
+                                f"{target_root / name}"
+                            )
+                    finally:
+                        os.close(existing_fd)
+                    os.rmdir(name, dir_fd=target_fd)
+                try:
+                    clone_directory_at(source_fd, name, target_fd, name)
+                except OSError as error:
+                    ensure_owned_child_directory(target_fd, name, target_root / name)
+                    raise SandboxError(
+                        "Swift package seeding failed; both sandboxes must live on "
+                        f"the same APFS volume: {error}"
+                    ) from error
+            finally:
+                os.close(target_fd)
+        finally:
+            os.close(source_fd)
+
+
+def prepare_ios_sandbox(
+    repo: Path,
+    source: str | None,
+    *,
+    seed_packages_from: Path | None = None,
+) -> tuple[Path, str | None]:
     with ios_lane_lease(repo):
         udid = ensure_owned_simulator(repo, source, lease_held=True) if source else None
-        return write_ios_environment(repo, udid), udid
+        env_path = write_ios_environment(repo, udid)
+        if seed_packages_from is not None:
+            seed_ios_source_packages(repo, seed_packages_from)
+        return env_path, udid
 
 
 def run_ios_build_lane(repo: Path, command: list[str]) -> int:
@@ -3213,6 +3329,7 @@ def parser() -> argparse.ArgumentParser:
     prepare = ios_commands.add_parser("prepare")
     prepare.add_argument("--repo", required=True, type=Path)
     prepare.add_argument("--clone-simulator")
+    prepare.add_argument("--seed-packages-from", type=Path)
     run = ios_commands.add_parser("run")
     run.add_argument("--repo", required=True, type=Path)
     run.add_argument("--source-simulator")
@@ -3277,7 +3394,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return subprocess.run(planned, check=False).returncode
         if args.action == "prepare":
-            env_path, udid = prepare_ios_sandbox(repo, args.clone_simulator)
+            seed_repo = (
+                git_root(args.seed_packages_from) if args.seed_packages_from else None
+            )
+            env_path, udid = prepare_ios_sandbox(
+                repo, args.clone_simulator, seed_packages_from=seed_repo
+            )
             print(env_path)
             if udid:
                 print(f"DEV_SANDBOX_SIMULATOR_UDID={udid}")
