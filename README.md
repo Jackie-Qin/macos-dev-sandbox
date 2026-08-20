@@ -47,6 +47,13 @@ python3 -m macos_dev_sandbox.cli ios build \
   --repo /path/to/ios-worktree -- \
   xcodebuild -project App.xcodeproj -scheme App \
   -destination 'generic/platform=iOS Simulator' -jobs 4 build-for-testing
+
+# Inspect stale worktree-owned simulator clones. This is dry-run by default.
+python3 -m macos_dev_sandbox.cli ios prune --max-idle-days 7
+
+# Delete only candidates that still pass the exact-UDID, shutdown, lease,
+# process-reference, open-file, and host-idle rechecks.
+python3 -m macos_dev_sandbox.cli ios prune --max-idle-days 7 --live
 ```
 
 For editable installation:
@@ -77,9 +84,11 @@ Container-side writes are disposable and do not flow back to the Git worktree. E
 
 The Xcode lane cannot provide the same security boundary. It isolates build and simulator state, uses exact-UDID destinations, leases one persistent clone per worktree, and never performs host-wide simulator shutdown. Host-native processes still retain the permissions of the macOS user, and CoreSimulator remains a per-login shared service. Use a dedicated macOS account or VM for untrusted code or a hard CoreSimulator boundary.
 
+Owned simulator metadata records the canonical worktree path, exact UDID and name, runtime, source UDID, creation time, and last-use time. Registry and per-worktree roots must be current-user-owned, nonsymlinked directories reached component-by-component with no-follow directory descriptors; metadata, locks, environment output, metadata retirement, and sandbox retirement/removal stay relative to those bound descriptors. Existing metadata and lock files must also be regular, current-user-owned, and single-linked. A present but malformed, misplaced, mismatched, hardlinked, or incompletely inventoried owner record blocks live pruning rather than being treated as absent. Each worktree's lease lives under the stable registry `.locks/` directory, outside the deletable sandbox root, and is held continuously across prepare/create/run/build/cleanup or acquired nonblocking by prune. `ios prune` validates the complete registry and rechecks it after lease acquisition. A device must still match its exact record, use the `dev-sandbox-` namespace, be shutdown, be stale for the configured interval (or have a missing owner worktree), and have no Apple build activity, process reference, or open file. Live deletion uses only `xcrun simctl delete <exact-UDID>`, verifies that the UDID disappeared from the complete device registry, and revalidates owner-record identity before FD-relative metadata retirement. Device creation revalidates the returned clone's exact name/runtime and deletes that exact UDID if ownership registration fails. Devices without trustworthy ownership metadata are protected rather than inferred from their names.
+
 Xcode's own parallel-testing workers may create additional transient clones. Per-worktree clones prevent accidental device reuse but do not namespace CoreSimulator itself.
 
-The build-only lane is intentionally narrower than `ios run`: it does not boot Simulator and rejects commands unless they are raw `xcodebuild build-for-testing` invocations with the exact generic iOS Simulator destination. This makes bounded concurrent compilation possible without changing a repository's normal test wrapper or lock policy.
+The build-only lane is intentionally narrower than `ios run`: it does not boot Simulator and rejects commands unless they are raw `xcodebuild build-for-testing` invocations with the exact generic iOS Simulator destination. Caller-supplied `-derivedDataPath`, `-clonedSourcePackagesDirPath`, and `-resultBundlePath` options—including `-option=value` forms—are rejected so artifact writes cannot escape the validated sandbox. This makes bounded concurrent compilation possible without changing a repository's normal test wrapper or lock policy.
 
 ### Qualified concurrency policy
 
