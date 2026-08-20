@@ -445,6 +445,132 @@ class IOSLaneTests(unittest.TestCase):
             self.assertNotIn(key, captured_environment)
 
 
+class IOSSeedTests(unittest.TestCase):
+    @contextmanager
+    def seed_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            registry = base / "registry"
+            seed_repo = base / "warm"
+            repo = base / "cold"
+            seed_repo.mkdir()
+            repo.mkdir()
+            with patch(
+                "macos_dev_sandbox.cli.simulator_registry_root", return_value=registry
+            ):
+                cli.write_ios_environment(seed_repo)
+                checkouts = sandbox_root(seed_repo) / "SourcePackages" / "checkouts"
+                checkouts.mkdir()
+                (checkouts / "Package.swift").write_text("// package\n")
+                yield repo, seed_repo
+
+    def test_parser_accepts_seed_packages_from(self) -> None:
+        args = cli.parser().parse_args(
+            ["ios", "prepare", "--repo", "/x", "--seed-packages-from", "/y"]
+        )
+        self.assertEqual(args.seed_packages_from, Path("/y"))
+
+    def test_seed_clones_packages_with_copy_on_write_independence(self) -> None:
+        with self.seed_fixture() as (repo, seed_repo):
+            cli.write_ios_environment(repo)
+            cli.seed_ios_source_packages(repo, seed_repo)
+            cloned = (
+                sandbox_root(repo) / "SourcePackages" / "checkouts" / "Package.swift"
+            )
+            self.assertEqual(cloned.read_text(), "// package\n")
+            cloned.write_text("// diverged\n")
+            original = (
+                sandbox_root(seed_repo)
+                / "SourcePackages"
+                / "checkouts"
+                / "Package.swift"
+            )
+            self.assertEqual(original.read_text(), "// package\n")
+
+    def test_prepare_seeds_when_requested(self) -> None:
+        with self.seed_fixture() as (repo, seed_repo):
+            env_path, udid = cli.prepare_ios_sandbox(
+                repo, None, seed_packages_from=seed_repo
+            )
+            self.assertTrue(env_path.is_file())
+            self.assertIsNone(udid)
+            cloned = (
+                sandbox_root(repo) / "SourcePackages" / "checkouts" / "Package.swift"
+            )
+            self.assertEqual(cloned.read_text(), "// package\n")
+
+    def test_seed_refuses_populated_target(self) -> None:
+        with self.seed_fixture() as (repo, seed_repo):
+            cli.write_ios_environment(repo)
+            marker = sandbox_root(repo) / "SourcePackages" / "existing.txt"
+            marker.write_text("keep\n")
+            with self.assertRaisesRegex(SandboxError, "already has Swift packages"):
+                cli.seed_ios_source_packages(repo, seed_repo)
+            self.assertEqual(marker.read_text(), "keep\n")
+
+    def test_seed_refuses_missing_seed_sandbox(self) -> None:
+        with self.seed_fixture() as (repo, _seed_repo):
+            cli.write_ios_environment(repo)
+            never_prepared = repo.parent / "never-prepared"
+            never_prepared.mkdir()
+            with self.assertRaisesRegex(SandboxError, "does not exist"):
+                cli.seed_ios_source_packages(repo, never_prepared)
+
+    def test_seed_refuses_empty_seed_packages(self) -> None:
+        with self.seed_fixture() as (repo, seed_repo):
+            cli.write_ios_environment(repo)
+            checkouts = sandbox_root(seed_repo) / "SourcePackages" / "checkouts"
+            (checkouts / "Package.swift").unlink()
+            checkouts.rmdir()
+            with self.assertRaisesRegex(SandboxError, "no Swift packages"):
+                cli.seed_ios_source_packages(repo, seed_repo)
+
+    def test_seed_refuses_seeding_from_itself(self) -> None:
+        with (
+            self.seed_fixture() as (_repo, seed_repo),
+            self.assertRaisesRegex(SandboxError, "own sandbox"),
+        ):
+            cli.seed_ios_source_packages(seed_repo, seed_repo)
+
+    def test_seed_refuses_busy_seed_sandbox(self) -> None:
+        with self.seed_fixture() as (repo, seed_repo):
+            cli.write_ios_environment(repo)
+            with (
+                cli.ios_lane_lease(seed_repo),
+                self.assertRaisesRegex(SandboxError, "in use"),
+            ):
+                cli.seed_ios_source_packages(repo, seed_repo)
+
+    def test_seed_refuses_symlinked_seed_packages(self) -> None:
+        with self.seed_fixture() as (repo, seed_repo):
+            cli.write_ios_environment(repo)
+            packages = sandbox_root(seed_repo) / "SourcePackages"
+            outside = repo.parent / "outside"
+            outside.mkdir()
+            (outside / "Package.swift").write_text("// outside\n")
+            (packages / "checkouts" / "Package.swift").unlink()
+            (packages / "checkouts").rmdir()
+            packages.rmdir()
+            packages.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(SandboxError, "unsafe seed Swift packages"):
+                cli.seed_ios_source_packages(repo, seed_repo)
+
+    def test_seed_restores_empty_directory_after_clone_failure(self) -> None:
+        with self.seed_fixture() as (repo, seed_repo):
+            cli.write_ios_environment(repo)
+            with (
+                patch(
+                    "macos_dev_sandbox.cli.clone_directory_at",
+                    side_effect=OSError(45, "Operation not supported"),
+                ),
+                self.assertRaisesRegex(SandboxError, "seeding failed"),
+            ):
+                cli.seed_ios_source_packages(repo, seed_repo)
+            packages = sandbox_root(repo) / "SourcePackages"
+            self.assertTrue(packages.is_dir())
+            self.assertEqual(list(packages.iterdir()), [])
+
+
 class IOSPruneTests(unittest.TestCase):
     NOW = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
     RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-26-3"
