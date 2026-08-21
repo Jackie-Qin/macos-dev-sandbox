@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -625,6 +626,26 @@ class IOSPruneTests(unittest.TestCase):
         ):
             cli.simulator_inventory(available_only=False)
 
+    @contextmanager
+    def isolated_registry(self) -> Iterator[Path]:
+        """Pin the home-derived simulator registry to a private temporary root.
+
+        ``sandbox_root`` resolves through ``simulator_registry_root``, so any
+        cleanup or prune path that is not handed an explicit root reaches the
+        real ``~/Library/Caches/macos-dev-sandbox``. On a machine that has never
+        run the tool that registry does not exist and the no-follow ownership
+        walk fails closed before the assertion under test is ever reached; on a
+        machine that has, the test writes into the developer's own cache. Tests
+        that exercise those paths must supply their own registry.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory).resolve()
+            with patch(
+                "macos_dev_sandbox.cli.simulator_registry_root",
+                return_value=registry,
+            ):
+                yield registry
+
     def write_metadata(
         self,
         base: Path,
@@ -728,8 +749,7 @@ class IOSPruneTests(unittest.TestCase):
             self.assertTrue(fresh.exists())
 
     def test_live_prune_rechecks_and_deletes_only_exact_udid(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+        with self.isolated_registry() as base:
             repo = base / "repo"
             repo.mkdir()
             metadata = self.write_metadata(base, repo, "EXACT")
@@ -1399,8 +1419,7 @@ class IOSPruneTests(unittest.TestCase):
     def test_live_prune_recovers_orphaned_retired_metadata_after_process_death(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory).resolve()
+        with self.isolated_registry() as base:
             repo = base / "missing-repo"
             metadata = self.write_metadata(base, repo, "ALREADY-DELETED")
             cli.write_ios_environment(repo, "ALREADY-DELETED")
@@ -2026,6 +2045,7 @@ class IOSPruneTests(unittest.TestCase):
             yield
 
         with (
+            self.isolated_registry(),
             patch("macos_dev_sandbox.cli.ios_lane_lease", side_effect=lease),
             patch("macos_dev_sandbox.cli.selected_cleanup_udid", return_value="OWNED"),
             patch("macos_dev_sandbox.cli.owned_simulator", return_value="OWNED"),
@@ -2057,6 +2077,7 @@ class IOSPruneTests(unittest.TestCase):
             yield
 
         with (
+            self.isolated_registry(),
             patch("macos_dev_sandbox.cli.ios_lane_lease", side_effect=lease),
             patch("macos_dev_sandbox.cli.selected_cleanup_udid", return_value="OWNED"),
             patch("macos_dev_sandbox.cli.owned_simulator", return_value="OWNED"),
